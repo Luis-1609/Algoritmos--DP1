@@ -1,99 +1,148 @@
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 
-/**
- * Búsqueda Tabú para replanificación de rutas en Tasf.B2B.
- *
- * ── Diseño ────────────────────────────────────────────────────────────────
- * Unidad de planificación : Pedido (las maletas de un pedido viajan juntas).
- * Solución inicial        : plan vigente del sistema (no se construye desde cero).
- * Tiempo                  : enteros donde cada unidad = 1 medio día.
- *
- * Vecindario (dos tipos de movimiento):
- *   REASIGNACION  : asigna un pedido elegido al azar a otra ruta disponible.
- *                   Primero rutas directas; si no hay cupo, rutas con escala.
- *   INTERCAMBIO   : swapea las rutas de dos pedidos si ambos cumplen el plazo
- *                   y la capacidad con la ruta del otro.
- *
- * Memoria:
- *   Lista tabú FIFO de capacidad τ. Prohíbe repetir el movimiento reciente.
- *   Criterio de aspiración: se permite un movimiento tabú si mejora s*.
- *
- * Criterios de parada:
- *   (a) Se alcanzan iteracionesMaximas.
- *   (b) Se acumulan iteracionesSinMejora iteraciones sin mejorar s*.
- * ──────────────────────────────────────────────────────────────────────────
- */
-public class TabuSearch implements Planificador {
+// =============================================================================
+// Parámetros de la Búsqueda Tabú
+// =============================================================================
+class ParametrosTS {
+    int    iterMaximas      = 300;
+    int    tamanoListaTabu  = 20;
+    int    vecinosPorIter   = 30;
+    int    maxSinMejora     = 60;
+    double umbralAmbar      = 500.0;
+    double umbralRojo       = 2000.0;
+}
 
-    private final ParametrosTS   params;
-    private final EvaluadorCosto evaluador;
-    private final Random         rnd = new Random(13);
+// =============================================================================
+// Clave tabú: identifica un movimiento (idPedido + idVuelo destino)
+// =============================================================================
+class ClaveTabu {
+    final String idPedido;
+    final int    idVuelo;
 
-    public TabuSearch(ParametrosTS params, EvaluadorCosto evaluador) {
-        this.params    = params;
-        this.evaluador = evaluador;
+    ClaveTabu(String idPedido, int idVuelo) {
+        this.idPedido = idPedido;
+        this.idVuelo  = idVuelo;
     }
 
-    // =========================================================================
-    // Punto de entrada principal
-    // =========================================================================
+    static ClaveTabu de(Movimiento m) {
+        return new ClaveTabu(m.pedido.id, m.nuevaRuta.primerVuelo().id);
+    }
 
-    @Override
-    public SolucionPlan planificar(ProblemaPlanificacion problema) {
+    @Override public boolean equals(Object o) {
+        if (!(o instanceof ClaveTabu c)) return false;
+        return idPedido.equals(c.idPedido) && idVuelo == c.idVuelo;
+    }
+    @Override public int hashCode() { return Objects.hash(idPedido, idVuelo); }
+}
 
-        // 1. Solución inicial: plan vigente (sección 3.3.1 del documento)
-        SolucionPlan actual = problema.getSolucionInicial().copia();
-        actual.setCosto(evaluador.costo(problema, actual));
+// =============================================================================
+// Lista tabú FIFO + HashSet O(1)
+// =============================================================================
+class ListaTabu {
+    private final int               cap;
+    private final ArrayDeque<ClaveTabu> cola;
+    private final HashSet<ClaveTabu>    idx;
+
+    ListaTabu(int cap) {
+        this.cap  = cap;
+        this.cola = new ArrayDeque<>(cap+1);
+        this.idx  = new HashSet<>(cap*2);
+    }
+
+    void agregar(ClaveTabu c) {
+        if (idx.contains(c)) return;
+        cola.addLast(c); idx.add(c);
+        if (cola.size() > cap) idx.remove(cola.removeFirst());
+    }
+
+    boolean esTabu(ClaveTabu c) { return idx.contains(c); }
+    void    limpiar()           { cola.clear(); idx.clear(); }
+}
+
+// =============================================================================
+// Movimiento de reasignación
+// =============================================================================
+class Movimiento {
+    final Pedido     pedido;
+    final RutaPedido nuevaRuta;
+    Movimiento(Pedido p, RutaPedido r) { this.pedido = p; this.nuevaRuta = r; }
+}
+
+// =============================================================================
+// TabuSearch
+// =============================================================================
+public class TabuSearch {
+
+    private final ParametrosTS           params;
+    private final EvaluadorCosto         eval;
+    private final Map<String,Aeropuerto> aeropuertos;
+    private final HeuristicaConstructiva heuristica;
+    private final Random                 rnd = new Random(42);
+
+    TabuSearch(ParametrosTS params, EvaluadorCosto eval,
+               Map<String,Aeropuerto> aeropuertos) {
+        this.params      = params;
+        this.eval        = eval;
+        this.aeropuertos = aeropuertos;
+        this.heuristica  = new HeuristicaConstructiva(aeropuertos);
+    }
+
+    // ── Punto de entrada ────────────────────────────────────────────────────
+    SolucionPlan planificar(SolucionPlan inicial,
+                             List<Pedido> pedidos,
+                             List<Vuelo>  vuelos) {
+
+        SolucionPlan actual = inicial.copia();
+        eval.costo(actual, pedidos, vuelos);
 
         SolucionPlan mejor     = actual.copia();
         ListaTabu    listaTabu = new ListaTabu(params.tamanoListaTabu);
         int          sinMejora = 0;
 
-        // 2. Ciclo principal
-        for (int iter = 0; iter < params.iteracionesMaximas; iter++) {
+        // Índice de vuelos por origen para generación de vecindario
+        Map<String,List<Vuelo>> porOrigen = new HashMap<>();
+        for (Vuelo v : vuelos) {
+            porOrigen.computeIfAbsent(v.origen, k -> new ArrayList<>()).add(v);
+        }
 
-            List<Movimiento> vecinos = generarVecinos(problema, actual);
+        for (int iter = 0; iter < params.iterMaximas; iter++) {
+
+            List<Movimiento> vecinos = generarVecinos(actual, pedidos, vuelos, porOrigen);
             if (vecinos.isEmpty()) break;
 
-            // 2a. Seleccionar el mejor movimiento permitido
-            Movimiento mejorMov          = null;
-            RutaPedido rutaAnteriorMejor = null;
-            double     mejorCosto        = Double.MAX_VALUE;
+            Movimiento   mejorMov   = null;
+            RutaPedido   rutaAnte   = null;
+            double       mejorCosto = Double.MAX_VALUE;
 
             for (Movimiento m : vecinos) {
-                ClaveTabu  clave    = ClaveTabu.de(m);
-                boolean    esTabu   = listaTabu.esTabu(clave);
-                RutaPedido rutaAntes = actual.rutaDe(m.pedido());
+                ClaveTabu clave   = ClaveTabu.de(m);
+                boolean   esTabu  = listaTabu.esTabu(clave);
+                RutaPedido antes  = actual.rutaDe(m.pedido);
 
-                // Aplicar temporalmente para evaluar
-                aplicar(actual, m);
-                double costoVecino = evaluador.costo(problema, actual);
+                // Aplicar temporalmente
+                actual.asignar(m.pedido, m.nuevaRuta);
+                double c = eval.costo(actual, pedidos, vuelos);
 
-                // Criterio de aspiración: se acepta aunque sea tabú
-                // si mejora la mejor solución global s*
-                boolean aspira = costoVecino < mejor.getCosto();
+                boolean aspira = c < mejor.costo; // criterio de aspiración
 
-                if ((!esTabu || aspira) && costoVecino < mejorCosto) {
-                    mejorCosto        = costoVecino;
-                    mejorMov          = m;
-                    rutaAnteriorMejor = rutaAntes;
+                if ((!esTabu || aspira) && c < mejorCosto) {
+                    mejorCosto = c;
+                    mejorMov   = m;
+                    rutaAnte   = antes;
                 }
-
-                // Siempre deshacer antes de evaluar el siguiente vecino
-                deshacer(actual, m, rutaAntes);
+                // Deshacer
+                if (antes != null) actual.asignar(m.pedido, antes);
+                else               actual.desasignar(m.pedido);
             }
 
-            // 2b. Aplicar el movimiento elegido definitivamente
             if (mejorMov == null) {
                 sinMejora++;
             } else {
-                aplicar(actual, mejorMov);
-                actual.setCosto(mejorCosto);
+                actual.asignar(mejorMov.pedido, mejorMov.nuevaRuta);
+                eval.costo(actual, pedidos, vuelos);
                 listaTabu.agregar(ClaveTabu.de(mejorMov));
 
-                if (mejorCosto < mejor.getCosto()) {
+                if (actual.costo < mejor.costo) {
                     mejor     = actual.copia();
                     sinMejora = 0;
                 } else {
@@ -101,134 +150,44 @@ public class TabuSearch implements Planificador {
                 }
             }
 
-            // 2c. Criterio de parada por estancamiento
-            if (sinMejora >= params.iteracionesSinMejora) break;
+            if (sinMejora >= params.maxSinMejora) break;
         }
 
         return mejor;
     }
 
-    // =========================================================================
-    // Generación del vecindario
-    // =========================================================================
-
-    private List<Movimiento> generarVecinos(ProblemaPlanificacion problema,
-                                             SolucionPlan actual) {
+    // ── Vecindario: reasignaciones de un pedido elegido al azar ─────────────
+    private List<Movimiento> generarVecinos(SolucionPlan sol,
+                                             List<Pedido>  pedidos,
+                                             List<Vuelo>   vuelos,
+                                             Map<String,List<Vuelo>> porOrigen) {
         List<Movimiento> vecinos = new ArrayList<>();
-        List<Pedido>     pedidos = problema.getPedidos();
         if (pedidos.isEmpty()) return vecinos;
 
-        int cuota = Math.max(1, params.vecinosPorIteracion / 2);
+        Pedido p = pedidos.get(rnd.nextInt(pedidos.size()));
 
-        // ── Tipo 1: Reasignación ─────────────────────────────────────────
-        Pedido elegido = pedidos.get(rnd.nextInt(pedidos.size()));
-        vecinos.addAll(reasignaciones(problema, elegido, actual, cuota));
+        // 1. Rutas directas alternativas
+        RutaPedido actual = sol.rutaDe(p);
+        for (Vuelo v : porOrigen.getOrDefault(p.origen, List.of())) {
+            if (v.cancelado || !v.destino.equals(p.destino)) continue;
+            if (v.salidaMin < p.ingresoMin)                  continue;
+            if (actual != null && v == actual.primerVuelo())  continue;
 
-        // ── Tipo 2: Intercambio ──────────────────────────────────────────
-        int intentos = 0;
-        int maxIntentos = params.vecinosPorIteracion * 3;
+            RutaPedido ruta = RutaPedido.directa(v);
+            if (!ruta.cumplePlazo(p, aeropuertos))           continue;
+            int libre = v.capacidad - sol.maletasEnVuelo(v, pedidos);
+            if (libre < p.cantMaletas)                        continue;
 
-        while (vecinos.size() < params.vecinosPorIteracion && intentos < maxIntentos) {
-            intentos++;
-            if (pedidos.size() < 2) break;
+            vecinos.add(new Movimiento(p, ruta));
+            if (vecinos.size() >= params.vecinosPorIter/2)   break;
+        }
 
-            Pedido p1 = pedidos.get(rnd.nextInt(pedidos.size()));
-            Pedido p2 = pedidos.get(rnd.nextInt(pedidos.size()));
-            if (p1.equals(p2)) continue;
-
-            RutaPedido r1 = actual.rutaDe(p1);
-            RutaPedido r2 = actual.rutaDe(p2);
-            if (r1 == null || r2 == null) continue;
-
-            // Válido si cada pedido cumple el plazo con la ruta del otro
-            // y la capacidad de los vuelos es suficiente
-            if (r2.cumplePlazo(p1) && r1.cumplePlazo(p2)
-                    && capacidadOk(problema, actual, p1, r2)
-                    && capacidadOk(problema, actual, p2, r1)) {
-                vecinos.add(new MovimientoIntercambio(p1, r2, p2, r1));
-            }
+        // 2. Rutas con escala
+        if (vecinos.size() < params.vecinosPorIter) {
+            RutaPedido escala = heuristica.mejorRutaConEscala(p, porOrigen, sol, pedidos);
+            if (escala != null) vecinos.add(new Movimiento(p, escala));
         }
 
         return vecinos;
-    }
-
-    /**
-     * Genera rutas alternativas para un pedido.
-     * Orden: primero directas (más rápidas), luego con escala.
-     */
-    private List<Movimiento> reasignaciones(ProblemaPlanificacion problema,
-                                             Pedido pedido,
-                                             SolucionPlan actual,
-                                             int max) {
-        List<Movimiento> movs      = new ArrayList<>();
-        RutaPedido       rutaActual = actual.rutaDe(pedido);
-
-        // 1. Vuelos directos
-        for (Vuelo v : problema.vuelosDirectos(pedido.getOrigen(),
-                                                pedido.getDestino())) {
-            if (v.isCancelado()) continue;
-            // No proponer la misma ruta que ya tiene
-            if (rutaActual != null && v.equals(rutaActual.primerVuelo())) continue;
-            // El vuelo debe salir después del ingreso del pedido
-            if (v.getSalida() < pedido.getIngreso()) continue;
-
-            RutaPedido nueva = RutaPedido.directa(v);
-            if (nueva.cumplePlazo(pedido) && capacidadOk(problema, actual, pedido, nueva))
-                movs.add(new Movimiento(pedido, nueva));
-
-            if (movs.size() >= max) return movs;
-        }
-
-        // 2. Rutas con una escala (si aún hay cupo en el vecindario)
-        for (RutaPedido ruta : problema.rutasConEscala(pedido)) {
-            if (capacidadOk(problema, actual, pedido, ruta))
-                movs.add(new Movimiento(pedido, ruta));
-            if (movs.size() >= max) break;
-        }
-
-        return movs;
-    }
-
-    /**
-     * Verifica que todos los vuelos de una ruta tengan capacidad libre
-     * para las maletas del pedido dado.
-     */
-    private boolean capacidadOk(ProblemaPlanificacion problema,
-                                  SolucionPlan actual,
-                                  Pedido pedido,
-                                  RutaPedido ruta) {
-        List<Pedido> todos = problema.getPedidos();
-        for (Vuelo v : ruta.getVuelos()) {
-            int libre = v.getCapacidadMaxima() - actual.maletasEnVuelo(v, todos);
-            if (libre < pedido.cantidadMaletas()) return false;
-        }
-        return true;
-    }
-
-    // =========================================================================
-    // Aplicar / Deshacer (para evaluación temporal y definitiva)
-    // =========================================================================
-
-    private void aplicar(SolucionPlan s, Movimiento m) {
-        if (m instanceof MovimientoIntercambio) {
-            MovimientoIntercambio mi = (MovimientoIntercambio) m;
-            s.asignar(mi.pedido(),  mi.nuevaRuta());
-            s.asignar(mi.pedido2(), mi.nuevaRuta2());
-        } else {
-            s.asignar(m.pedido(), m.nuevaRuta());
-        }
-    }
-
-    private void deshacer(SolucionPlan s, Movimiento m, RutaPedido rutaAnterior) {
-        if (m instanceof MovimientoIntercambio) {
-            MovimientoIntercambio mi = (MovimientoIntercambio) m;
-            // rutaAnterior = ruta original de pedido()
-            // nuevaRuta()  = ruta original de pedido2() (se la pasamos en el constructor)
-            s.asignar(mi.pedido(),  rutaAnterior);
-            s.asignar(mi.pedido2(), mi.nuevaRuta());
-        } else {
-            if (rutaAnterior != null) s.asignar(m.pedido(), rutaAnterior);
-            else                      s.desasignar(m.pedido());
-        }
     }
 }
